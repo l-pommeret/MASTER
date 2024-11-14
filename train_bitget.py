@@ -87,7 +87,7 @@ class BitgetTrainer:
         return model
 
     def fetch_latest_data(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Récupère les dernières données de Bitget"""
+        """Récupère les dernières données de Bitget avec vérification"""
         try:
             # Récupération OHLCV
             ohlcv = self.exchange.fetch_ohlcv(
@@ -96,59 +96,101 @@ class BitgetTrainer:
                 limit=self.config['lookback_window']
             )
             
+            # Vérification de la taille des données
+            if len(ohlcv) < self.config['lookback_window']:
+                self.logger.warning(f"Données incomplètes: {len(ohlcv)} < {self.config['lookback_window']}")
+                return None, None
+                
             # Conversion en DataFrame
             df = pd.DataFrame(
                 ohlcv,
                 columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df.set_index('timestamp')
+            
+            # Vérification des valeurs manquantes
+            if df.isna().any().any():
+                self.logger.warning("Valeurs manquantes détectées")
+                df = df.fillna(method='ffill').fillna(method='bfill')
             
             # Calcul des features
             features = self._calculate_features(df)
-            label = self._calculate_label(df)
             
-            return features, label
+            # Calcul du label (retour futur)
+            current_price = df['close'].iloc[-1]
+            previous_price = df['close'].iloc[-2]
+            label = (current_price / previous_price) - 1
             
+            return features, np.array([label])
+                
         except Exception as e:
             self.logger.error(f"Erreur lors de la récupération des données: {e}")
             return None, None
 
     def _calculate_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Calcule toutes les features techniques"""
+        """Calcule toutes les features techniques avec vérification des dimensions"""
         features = []
+        length = len(df)
         
-        # Prix normalisés
-        for col in ['open', 'high', 'low', 'close']:
-            series = df[col].values
-            features.append(self._normalize_series(series))
-        
-        # Volumes
-        vol = df['volume'].values
-        features.append(self._normalize_series(vol))
-        
-        # Returns
-        returns = np.diff(np.log(df['close'].values))
-        features.append(np.pad(returns, (1,0), 'constant'))
-        
-        # Volatilité
-        for window in [5, 15, 30]:
-            vol = pd.Series(returns).rolling(window).std().values
-            features.append(self._normalize_series(vol))
-        
-        # RSI
-        for window in [6, 14, 24]:
-            rsi = self._calculate_rsi(df['close'], window)
-            features.append(rsi)
-        
-        # Moyennes mobiles
-        for window in [7, 25, 99]:
-            ma = df['close'].rolling(window).mean().values
-            features.append(self._normalize_series(ma))
-        
-        # MACD
-        macd, signal = self._calculate_macd(df['close'])
-        features.extend([macd, signal])
-        
-        return np.stack(features, axis=1)
+        try:
+            # Prix normalisés
+            for col in ['open', 'high', 'low', 'close']:
+                series = df[col].values
+                normalized = self._normalize_series(series)
+                print(f"Shape de {col}: {normalized.shape}")
+                features.append(normalized)
+            
+            # Volumes
+            vol = df['volume'].values
+            normalized_vol = self._normalize_series(vol)
+            print(f"Shape du volume: {normalized_vol.shape}")
+            features.append(normalized_vol)
+            
+            # Returns
+            returns = np.diff(np.log(df['close'].values))
+            padded_returns = np.pad(returns, (1,0), 'constant')
+            print(f"Shape des returns: {padded_returns.shape}")
+            features.append(padded_returns)
+            
+            # Volatilité
+            for window in [5, 15, 30]:
+                vol = pd.Series(returns).rolling(window).std().fillna(0).values
+                normalized_vol = self._normalize_series(vol)
+                print(f"Shape de la volatilité {window}: {normalized_vol.shape}")
+                features.append(normalized_vol)
+            
+            # RSI
+            for window in [6, 14, 24]:
+                rsi = self._calculate_rsi(df['close'], window)
+                print(f"Shape du RSI {window}: {rsi.shape}")
+                features.append(rsi)
+            
+            # Moyennes mobiles
+            for window in [7, 25, 99]:
+                ma = df['close'].rolling(window).mean().fillna(method='bfill').values
+                normalized_ma = self._normalize_series(ma)
+                print(f"Shape de la MA {window}: {normalized_ma.shape}")
+                features.append(normalized_ma)
+            
+            # MACD
+            macd, signal = self._calculate_macd(df['close'])
+            print(f"Shape du MACD: {macd.shape}")
+            print(f"Shape du signal MACD: {signal.shape}")
+            features.extend([macd, signal])
+            
+            # Vérification finale
+            all_features = np.stack(features, axis=1)
+            print(f"Shape finale des features: {all_features.shape}")
+            
+            return all_features
+            
+        except Exception as e:
+            print(f"Erreur dans le calcul des features: {str(e)}")
+            print(f"Longueur du DataFrame: {length}")
+            for i, feature in enumerate(features):
+                print(f"Feature {i} shape: {feature.shape}")
+            raise e
 
     def _normalize_series(self, series: np.ndarray) -> np.ndarray:
         """Normalisation robuste d'une série"""
@@ -158,7 +200,7 @@ class BitgetTrainer:
         return np.clip(normalized, -3, 3)
 
     def _calculate_rsi(self, prices: pd.Series, window: int) -> np.ndarray:
-        """Calcule le RSI"""
+        """Calcule le RSI avec gestion des NaN"""
         delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
@@ -167,12 +209,15 @@ class BitgetTrainer:
         return rsi.fillna(50).values
 
     def _calculate_macd(self, prices: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
-        """Calcule le MACD"""
+        """Calcule le MACD avec gestion des NaN"""
         exp1 = prices.ewm(span=12).mean()
         exp2 = prices.ewm(span=26).mean()
         macd = exp1 - exp2
         signal = macd.ewm(span=9).mean()
-        return macd.values, signal.values
+        # Remplissage des NaN
+        macd = macd.fillna(method='bfill').fillna(0).values
+        signal = signal.fillna(method='bfill').fillna(0).values
+        return macd, signal
 
     def train_iteration(self):
         """Effectue une itération d'entraînement"""
