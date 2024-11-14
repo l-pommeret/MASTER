@@ -292,7 +292,7 @@ if __name__ == "__main__":
             'api_secret': '',
             'passphrase': '',
             'batch_size': 32,
-            'update_interval': 3600,
+            'update_interval': 60,
             'min_samples': 1000,
             'lookback_window': 120
         }
