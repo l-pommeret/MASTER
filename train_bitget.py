@@ -138,45 +138,38 @@ class BitgetTrainer:
             for col in ['open', 'high', 'low', 'close']:
                 series = df[col].values
                 normalized = self._normalize_series(series)
-                print(f"Shape de {col}: {normalized.shape}")
                 features.append(normalized)
             
             # Volumes
             vol = df['volume'].values
             normalized_vol = self._normalize_series(vol)
-            print(f"Shape du volume: {normalized_vol.shape}")
             features.append(normalized_vol)
             
             # Returns
             returns = np.diff(np.log(df['close'].values))
             padded_returns = np.pad(returns, (1,0), 'constant')
-            print(f"Shape des returns: {padded_returns.shape}")
             features.append(padded_returns)
             
-            # Volatilité
+            # Volatilité - CORRECTION ICI
+            returns_series = pd.Series(padded_returns)  # Utilisation des returns déjà paddés
             for window in [5, 15, 30]:
-                vol = pd.Series(returns).rolling(window).std().fillna(0).values
+                vol = returns_series.rolling(window).std().fillna(0).values
                 normalized_vol = self._normalize_series(vol)
-                print(f"Shape de la volatilité {window}: {normalized_vol.shape}")
                 features.append(normalized_vol)
             
             # RSI
             for window in [6, 14, 24]:
                 rsi = self._calculate_rsi(df['close'], window)
-                print(f"Shape du RSI {window}: {rsi.shape}")
                 features.append(rsi)
             
             # Moyennes mobiles
             for window in [7, 25, 99]:
-                ma = df['close'].rolling(window).mean().fillna(method='bfill').values
+                ma = df['close'].rolling(window).mean().fillna(0).values
                 normalized_ma = self._normalize_series(ma)
-                print(f"Shape de la MA {window}: {normalized_ma.shape}")
                 features.append(normalized_ma)
             
             # MACD
             macd, signal = self._calculate_macd(df['close'])
-            print(f"Shape du MACD: {macd.shape}")
-            print(f"Shape du signal MACD: {signal.shape}")
             features.extend([macd, signal])
             
             # Vérification finale
@@ -208,6 +201,7 @@ class BitgetTrainer:
         rsi = 100 - (100 / (1 + rs))
         return rsi.fillna(50).values
 
+    # Mise à jour de fillna pour éviter les warnings
     def _calculate_macd(self, prices: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
         """Calcule le MACD avec gestion des NaN"""
         exp1 = prices.ewm(span=12).mean()
@@ -215,8 +209,8 @@ class BitgetTrainer:
         macd = exp1 - exp2
         signal = macd.ewm(span=9).mean()
         # Remplissage des NaN
-        macd = macd.fillna(method='bfill').fillna(0).values
-        signal = signal.fillna(method='bfill').fillna(0).values
+        macd = macd.bfill().fillna(0).values
+        signal = signal.bfill().fillna(0).values
         return macd, signal
 
     def train_iteration(self):
