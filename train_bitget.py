@@ -395,12 +395,23 @@ class BitgetTrainer:
                 train_features = np.stack(self.data_buffer['features'][-self.min_samples:])
                 train_labels = np.array(self.data_buffer['labels'][-self.min_samples:])
                 
-                # Mise à jour du modèle
-                self.logger.info("Mise à jour du modèle...")
-                predictions = self.model.predict(train_features)
+                # Division train/validation (80/20)
+                split_idx = int(len(train_features) * 0.8)
+                train_data = train_features[:split_idx]
+                train_labels_data = train_labels[:split_idx]
+                valid_data = train_features[split_idx:]
+                valid_labels_data = train_labels[split_idx:]
+                
+                # Entraînement du modèle
+                self.logger.info("Entraînement du modèle...")
+                self.model.fit(train_data, train_labels_data)
+                
+                # Prédictions et évaluation
+                self.logger.info("Évaluation du modèle...")
+                predictions = self.model.predict(valid_data)
                 
                 # Calcul des métriques
-                metrics = self.calculate_metrics(predictions, train_labels)
+                metrics = self.calculate_metrics(predictions, valid_labels_data)
                 
                 self.logger.info(f"Résultats de l'itération {self.training_metrics['iterations']+1}:")
                 self.logger.info(f"- MSE Loss: {metrics['mse_loss']:.6f}")

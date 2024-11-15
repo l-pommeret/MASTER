@@ -139,70 +139,55 @@ class CryptoSequenceModel():
         )
         self.fitted = True
 
-    def fit(self, dl_train, dl_valid):
-        train_loader = self._init_data_loader(dl_train, shuffle=True)
-        valid_loader = self._init_data_loader(dl_valid, shuffle=False)
+    def fit(self, train_features, train_labels):
+        """Entraîne le modèle avec des données numpy"""
+        self.model.train()
         
-        self.fitted = True
+        # Conversion en tenseurs PyTorch
+        features = torch.FloatTensor(train_features).to(self.device)
+        labels = torch.FloatTensor(train_labels).to(self.device)
+        
+        best_loss = float('inf')
         best_param = None
-        best_valid_loss = float('inf')
         
-        for step in range(self.n_epochs):
-            train_loss = self.train_epoch(train_loader)
-            valid_loss = self.test_epoch(valid_loader)
+        for epoch in range(self.n_epochs):
+            self.train_optimizer.zero_grad()
             
-            print(f"Epoch {step}, train_loss {train_loss:.6f}, valid_loss {valid_loss:.6f}")
+            # Forward pass
+            predictions = self.model(features)
+            loss = self.loss_fn(predictions, labels)
             
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 1.0)
+            self.train_optimizer.step()
+            
+            current_loss = loss.item()
+            print(f"Epoch {epoch}, loss: {current_loss:.6f}")
+            
+            # Sauvegarde du meilleur modèle
+            if current_loss < best_loss:
+                best_loss = current_loss
                 best_param = copy.deepcopy(self.model.state_dict())
-            
-            if train_loss <= self.train_stop_loss_thred:
-                break
                 
-        # Sauvegarde du meilleur modèle
-        torch.save(
-            best_param,
-            f'{self.save_path}{self.save_prefix}crypto_master_{self.seed}.pkl'
-        )
+            if current_loss <= self.train_stop_loss_thred:
+                break
         
-        # Charge le meilleur modèle pour la suite
-        self.model.load_state_dict(best_param)
+        # Charge le meilleur modèle
+        if best_param is not None:
+            self.model.load_state_dict(best_param)
+            
+        self.fitted = True
+        return best_loss
 
-    def predict(self, dl_test):
+    def predict(self, features):
+        """Fait des prédictions sur des données numpy"""
         if not self.fitted:
             raise ValueError("model is not fitted yet!")
             
-        test_loader = self._init_data_loader(dl_test, shuffle=False, drop_last=False)
-        
-        preds = []
-        ic = []
-        ric = []
-        
         self.model.eval()
         with torch.no_grad():
-            for data in test_loader:
-                data = torch.squeeze(data, dim=0)
-                feature = data[:, :, :-1].to(self.device)
-                label = data[:, -1, -1]
-                
-                pred = self.model(feature.float()).cpu().numpy()
-                preds.append(pred.ravel())
-                
-                daily_ic, daily_ric = calc_ic(pred, label.numpy())
-                ic.append(daily_ic)
-                ric.append(daily_ric)
-                
-        predictions = pd.Series(
-            np.concatenate(preds), 
-            index=dl_test.get_index()
-        )
-        
-        metrics = {
-            'IC': np.mean(ic),
-            'ICIR': np.mean(ic)/np.std(ic),
-            'RIC': np.mean(ric),
-            'RICIR': np.mean(ric)/np.std(ric)
-        }
-        
-        return predictions, metrics
+            features = torch.FloatTensor(features).to(self.device)
+            predictions = self.model(features).cpu().numpy()
+            
+        return predictions
