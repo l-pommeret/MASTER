@@ -26,25 +26,7 @@ class BitgetTrainer:
         # Chargement de la configuration
         self.config = self._load_config(config_path)
         
-        # Setup du device (GPU/CPU)
-        self.device = torch.device(f"cuda:{self.model_params['GPU']}" 
-                                if torch.cuda.is_available() and self.model_params['GPU'] is not None 
-                                else "cpu")
-        
-        # Métriques de suivi
-        self.training_metrics = {
-            'iterations': 0,
-            'total_samples': 0,
-            'best_loss': float('inf'),
-            'best_accuracy': 0.0,
-            'last_save': None,
-            'training_start': datetime.now().isoformat()
-        }
-
-        # Initialisation de l'exchange
-        self.exchange = self._init_exchange()
-        
-        # Paramètres du modèle
+        # Paramètres du modèle (à définir avant device)
         self.model_params = {
             'd_feat': 40,
             'd_model': 256,
@@ -62,6 +44,24 @@ class BitgetTrainer:
             'train_stop_loss_thred': 0.95
         }
 
+        # Setup du device (après model_params)
+        self.device = torch.device(f"cuda:{self.model_params['GPU']}" 
+                                if torch.cuda.is_available() and self.model_params['GPU'] is not None 
+                                else "cpu")
+        
+        # Métriques de suivi
+        self.training_metrics = {
+            'iterations': 0,
+            'total_samples': 0,
+            'best_loss': float('inf'),
+            'best_accuracy': 0.0,
+            'last_save': None,
+            'training_start': datetime.now().isoformat()
+        }
+
+        # Initialisation de l'exchange
+        self.exchange = self._init_exchange()
+
         # Initialisation du modèle
         self.model = self._init_or_load_model(model_path)
         
@@ -77,6 +77,9 @@ class BitgetTrainer:
             'labels': [],
             'timestamps': []
         }
+
+        self.logger.info("Initialisation terminée")
+        self._log_config()
 
     def _setup_logging(self, log_level: str):
         """Configure le système de logging"""
