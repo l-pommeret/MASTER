@@ -499,14 +499,14 @@ if __name__ == "__main__":
     # Configuration par défaut si nécessaire
     if not os.path.exists('config/bitget_config.json'):
         default_config = {
-            'api_key': '',
-            'api_secret': '',
-            'passphrase': '',
-            'batch_size': 32,
-            'update_interval': 60,  # 1 minute
-            'min_samples': 1000,
-            'lookback_window': 120
-        }
+                'api_key': '',
+                'api_secret': '',
+                'passphrase': '',
+                'batch_size': 32,
+                'update_interval': 5,      # 5 secondes au lieu de 60
+                'min_samples': 100,        # 100 échantillons au lieu de 1000
+                'lookback_window': 60      # 60 minutes au lieu de 120
+            }
         with open('config/bitget_config.json', 'w') as f:
             json.dump(default_config, f, indent=4)
             
