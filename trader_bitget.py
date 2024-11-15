@@ -10,6 +10,7 @@ from pathlib import Path
 from master import MASTERModel
 import threading
 from typing import Dict, Tuple
+import os
 
 class BitgetTrader:
     def __init__(
