@@ -355,7 +355,7 @@ class BitgetTrainer:
             self.logger.error(f"Erreur lors de la sauvegarde: {e}", exc_info=True)
 
     def train_iteration(self):
-        """Effectue une itération d'entraînement avec logging détaillé"""
+        """Effectue une itération d'entraînement avec gestion robuste des données"""
         iteration_start = time.time()
         
         try:
@@ -364,67 +364,114 @@ class BitgetTrainer:
             # Récupération des données
             self.logger.info("Récupération des dernières données...")
             features, label = self.fetch_latest_data()
+            
             if features is None or label is None:
                 self.logger.warning("Pas de données disponibles pour cette itération")
                 return
+            
+            # Vérification des dimensions
+            self.logger.debug(f"Dimensions des features: {features.shape}")
+            self.logger.debug(f"Dimensions du label: {label.shape}")
+            
+            # Ajout au buffer avec vérification
+            try:
+                self.data_buffer['features'].append(features)
+                self.data_buffer['labels'].append(label)
+                self.data_buffer['timestamps'].append(datetime.now())
                 
-            self.logger.debug(f"Données récupérées - Features shape: {features.shape}")
+                buffer_size = len(self.data_buffer['features'])
+                self.logger.info(f"Buffer actuel: {buffer_size}/{self.min_samples} échantillons")
+                
+            except Exception as e:
+                self.logger.error(f"Erreur lors de l'ajout au buffer: {e}")
+                raise
             
-            # Ajout au buffer
-            self.data_buffer['features'].append(features)
-            self.data_buffer['labels'].append(label)
-            self.data_buffer['timestamps'].append(datetime.now())
-            
-            buffer_size = len(self.data_buffer['features'])
-            self.logger.info(f"Buffer actuel: {buffer_size}/{self.min_samples} échantillons")
-            
-            # Nettoyage du buffer
-            cutoff_time = datetime.now() - timedelta(hours=24)
-            before_clean = len(self.data_buffer['features'])
-            self._clean_buffer(cutoff_time)
-            after_clean = len(self.data_buffer['features'])
-            
-            if before_clean != after_clean:
-                self.logger.info(f"Nettoyage buffer: {before_clean} -> {after_clean} échantillons")
+            # Nettoyage du buffer des données anciennes
+            try:
+                cutoff_time = datetime.now() - timedelta(hours=24)
+                before_clean = len(self.data_buffer['features'])
+                self._clean_buffer(cutoff_time)
+                after_clean = len(self.data_buffer['features'])
+                
+                if before_clean != after_clean:
+                    self.logger.info(f"Nettoyage buffer: {before_clean} -> {after_clean} échantillons")
+                    
+            except Exception as e:
+                self.logger.error(f"Erreur lors du nettoyage du buffer: {e}")
+                raise
             
             # Entraînement si assez de données
             if len(self.data_buffer['features']) >= self.min_samples:
                 self.logger.info("Préparation des données d'entraînement...")
                 
-                # Préparation des données
-                train_features = np.stack(self.data_buffer['features'][-self.min_samples:])
-                train_labels = np.array(self.data_buffer['labels'][-self.min_samples:])
-                
-                # Division train/validation (80/20)
-                split_idx = int(len(train_features) * 0.8)
-                train_data = train_features[:split_idx]
-                train_labels_data = train_labels[:split_idx]
-                valid_data = train_features[split_idx:]
-                valid_labels_data = train_labels[split_idx:]
-                
-                # Entraînement du modèle
-                self.logger.info("Entraînement du modèle...")
-                self.model.fit(train_data, train_labels_data)
-                
-                # Prédictions et évaluation
-                self.logger.info("Évaluation du modèle...")
-                predictions = self.model.predict(valid_data)
-                
-                # Calcul des métriques
-                metrics = self.calculate_metrics(predictions, valid_labels_data)
-                
-                self.logger.info(f"Résultats de l'itération {self.training_metrics['iterations']+1}:")
-                self.logger.info(f"- MSE Loss: {metrics['mse_loss']:.6f}")
-                self.logger.info(f"- Direction Accuracy: {metrics['direction_accuracy']:.4f}")
-                
-                # Vérification si on doit sauvegarder
-                if self.should_save_model(metrics['mse_loss'], metrics['direction_accuracy']):
-                    metrics['training_duration'] = time.time() - iteration_start
-                    self.save_model(metrics)
-                
-                # Mise à jour des métriques
-                self.training_metrics['iterations'] += 1
-                self.training_metrics['total_samples'] += len(train_labels)
+                try:
+                    # Préparation des données
+                    features_array = np.stack(self.data_buffer['features'][-self.min_samples:])
+                    labels_array = np.array(self.data_buffer['labels'][-self.min_samples:])
+                    
+                    # Vérification et log des dimensions
+                    self.logger.debug(f"Shape des features: {features_array.shape}")
+                    self.logger.debug(f"Shape des labels: {labels_array.shape}")
+                    
+                    # Vérification des NaN
+                    if np.isnan(features_array).any() or np.isnan(labels_array).any():
+                        self.logger.warning("Détection de NaN dans les données")
+                        features_array = np.nan_to_num(features_array, nan=0.0)
+                        labels_array = np.nan_to_num(labels_array, nan=0.0)
+                    
+                    # Division train/validation (80/20)
+                    split_idx = int(len(features_array) * 0.8)
+                    train_features = features_array[:split_idx]
+                    train_labels = labels_array[:split_idx]
+                    valid_features = features_array[split_idx:]
+                    valid_labels = labels_array[split_idx:]
+                    
+                    # Log des dimensions après split
+                    self.logger.debug(f"Train features shape: {train_features.shape}")
+                    self.logger.debug(f"Train labels shape: {train_labels.shape}")
+                    self.logger.debug(f"Valid features shape: {valid_features.shape}")
+                    self.logger.debug(f"Valid labels shape: {valid_labels.shape}")
+                    
+                    # Entraînement du modèle
+                    self.logger.info("Entraînement du modèle...")
+                    
+                    # Conversion en tenseurs PyTorch
+                    train_features = torch.FloatTensor(train_features).to(self.device)
+                    train_labels = torch.FloatTensor(train_labels).to(self.device)
+                    valid_features = torch.FloatTensor(valid_features).to(self.device)
+                    valid_labels = torch.FloatTensor(valid_labels).to(self.device)
+                    
+                    # Entraînement
+                    try:
+                        train_loss = self.model.fit(train_features, train_labels)
+                        self.logger.info(f"Loss d'entraînement: {train_loss:.6f}")
+                        
+                        # Évaluation
+                        with torch.no_grad():
+                            predictions = self.model.predict(valid_features)
+                            metrics = self.calculate_metrics(predictions.cpu().numpy(), valid_labels.cpu().numpy())
+                        
+                        self.logger.info(f"Résultats de l'itération {self.training_metrics['iterations']+1}:")
+                        self.logger.info(f"- MSE Loss: {metrics['mse_loss']:.6f}")
+                        self.logger.info(f"- Direction Accuracy: {metrics['direction_accuracy']:.4f}")
+                        
+                        # Vérification pour la sauvegarde
+                        if self.should_save_model(metrics['mse_loss'], metrics['direction_accuracy']):
+                            metrics['training_duration'] = time.time() - iteration_start
+                            self.save_model(metrics)
+                        
+                        # Mise à jour des métriques
+                        self.training_metrics['iterations'] += 1
+                        self.training_metrics['total_samples'] += len(train_labels)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Erreur pendant l'entraînement: {str(e)}")
+                        self.logger.error(f"Shapes - Train Features: {train_features.shape}, Train Labels: {train_labels.shape}")
+                        raise
+                    
+                except Exception as e:
+                    self.logger.error(f"Erreur lors de la préparation des données: {str(e)}")
+                    raise
                 
                 iteration_duration = time.time() - iteration_start
                 self.logger.info(f"Itération terminée en {iteration_duration:.2f} secondes")
@@ -440,8 +487,9 @@ class BitgetTrainer:
                 self.logger.info(f"Pas assez d'échantillons pour l'entraînement ({len(self.data_buffer['features'])}/{self.min_samples})")
             
         except Exception as e:
-            self.logger.error(f"Erreur lors de l'entraînement: {e}", exc_info=True)
+            self.logger.error(f"Erreur lors de l'entraînement: {e}")
             self.logger.error("Stack trace complète:", exc_info=True)
+            # Pas de raise ici pour permettre à la boucle principale de continuer
 
     def _clean_buffer(self, cutoff_time: datetime):
         """Nettoie le buffer des anciennes données"""

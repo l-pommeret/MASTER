@@ -1,15 +1,11 @@
 import torch
 from torch import nn
-from torch.nn.modules.linear import Linear
-from torch.nn.modules.dropout import Dropout
-from torch.nn.modules.normalization import LayerNorm
 import math
-
 from base_model import CryptoSequenceModel
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=120):  # 120 minutes au lieu de 100
-        super(PositionalEncoding, self).__init__()
+    def __init__(self, d_model, max_len=120):
+        super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -21,245 +17,209 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.shape[1], :]
 
 class SAttention(nn.Module):
-    """Attention spatiale adaptée pour les cryptos"""
     def __init__(self, d_model, nhead, dropout):
         super().__init__()
-
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        
         self.d_model = d_model
         self.nhead = nhead
-        self.temperature = math.sqrt(self.d_model/nhead)
+        self.head_dim = d_model // nhead
+        self.scale = math.sqrt(self.head_dim)
 
-        # Projections Q/K/V
-        self.qtrans = nn.Linear(d_model, d_model, bias=True)  # Ajout du bias
-        self.ktrans = nn.Linear(d_model, d_model, bias=True)
-        self.vtrans = nn.Linear(d_model, d_model, bias=True)
-
-        # Dropout par tête avec régularisation
-        self.attn_dropout = nn.ModuleList([
-            Dropout(p=dropout) for _ in range(nhead)
-        ])
-
-        # Normalisation et FFN
-        self.norm1 = LayerNorm(d_model, eps=1e-5)
-        self.norm2 = LayerNorm(d_model, eps=1e-5)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            Linear(d_model, d_model * 2),
-            nn.GELU(),  # GELU au lieu de ReLU
-            Dropout(p=dropout),
-            Linear(d_model * 2, d_model),
-            Dropout(p=dropout)
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
-        x = self.norm1(x)
-        q = self.qtrans(x).transpose(0,1)
-        k = self.ktrans(x).transpose(0,1)
-        v = self.vtrans(x).transpose(0,1)
-
-        dim = int(self.d_model/self.nhead)
-        att_output = []
+        B, L, C = x.shape
         
-        for i in range(self.nhead):
-            if i == self.nhead-1:
-                qh = q[:, :, i * dim:]
-                kh = k[:, :, i * dim:]
-                vh = v[:, :, i * dim:]
-            else:
-                qh = q[:, :, i * dim:(i + 1) * dim]
-                kh = k[:, :, i * dim:(i + 1) * dim]
-                vh = v[:, :, i * dim:(i + 1) * dim]
+        # Multi-head attention
+        x = self.norm1(x)
+        qkv = self.qkv_proj(x).reshape(B, L, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-            # Attention avec scaling dynamique
-            scores = torch.matmul(qh, kh.transpose(1, 2))
-            scaling = self.temperature * torch.sqrt(torch.tensor(1.0 + torch.std(scores)))
-            scores = scores / scaling
-            
-            atten_weights = torch.softmax(scores, dim=-1)
-            atten_weights = self.attn_dropout[i](atten_weights)
-            
-            att_output.append(torch.matmul(atten_weights, vh).transpose(0, 1))
-            
-        att_output = torch.concat(att_output, dim=-1)
-
-        # FFN avec connexion résiduelle
-        xt = x + att_output
-        xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
-
-        return att_output
+        # Attention scores
+        attn = (q @ k.transpose(-2, -1)) / self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # Attention output
+        x = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        x = self.out_proj(x)
+        
+        # FFN
+        out = self.norm2(x)
+        out = out + self.ffn(out)
+        
+        return out
 
 class TAttention(nn.Module):
-    """Attention temporelle adaptée pour la haute fréquence"""
     def __init__(self, d_model, nhead, dropout):
         super().__init__()
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        
         self.d_model = d_model
         self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.scale = math.sqrt(self.head_dim)
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(d_model, d_model)
         
-        # Projections avec bias
-        self.qtrans = nn.Linear(d_model, d_model, bias=True)
-        self.ktrans = nn.Linear(d_model, d_model, bias=True)
-        self.vtrans = nn.Linear(d_model, d_model, bias=True)
-
-        # Dropout adaptatif
-        self.attn_dropout = nn.ModuleList([
-            Dropout(p=dropout) for _ in range(nhead)
-        ])
-
-        # Normalisation et FFN
-        self.norm1 = LayerNorm(d_model, eps=1e-5)
-        self.norm2 = LayerNorm(d_model, eps=1e-5)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            Linear(d_model, d_model * 2),
+            nn.Linear(d_model, d_model * 4),
             nn.GELU(),
-            Dropout(p=dropout),
-            Linear(d_model * 2, d_model),
-            Dropout(p=dropout)
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
-        x = self.norm1(x)
-        q = self.qtrans(x)
-        k = self.ktrans(x)
-        v = self.vtrans(x)
-
-        dim = int(self.d_model / self.nhead)
-        att_output = []
+        B, L, C = x.shape
         
-        for i in range(self.nhead):
-            if i == self.nhead-1:
-                qh = q[:, :, i * dim:]
-                kh = k[:, :, i * dim:]
-                vh = v[:, :, i * dim:]
-            else:
-                qh = q[:, :, i * dim:(i + 1) * dim]
-                kh = k[:, :, i * dim:(i + 1) * dim]
-                vh = v[:, :, i * dim:(i + 1) * dim]
+        # Multi-head attention
+        x = self.norm1(x)
+        qkv = self.qkv_proj(x).reshape(B, L, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-            # Attention avec masque causal
-            scores = torch.matmul(qh, kh.transpose(1, 2))
-            
-            # Masque pour donner plus de poids aux données récentes
-            seq_len = scores.size(-1)
-            mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).to(x.device)
-            scores = scores.masked_fill(mask == 1, float('-inf'))
-            
-            atten_weights = torch.softmax(scores, dim=-1)
-            if self.attn_dropout:
-                atten_weights = self.attn_dropout[i](atten_weights)
-                
-            att_output.append(torch.matmul(atten_weights, vh))
-            
-        att_output = torch.concat(att_output, dim=-1)
+        # Causal mask
+        mask = torch.triu(torch.ones(L, L), diagonal=1).bool()
+        mask = mask.to(x.device)
 
-        # FFN avec connexion résiduelle
-        xt = x + att_output
-        xt = self.norm2(xt)
-        att_output = xt + self.ffn(xt)
-
-        return att_output
+        # Attention scores avec masque causal
+        attn = (q @ k.transpose(-2, -1)) / self.scale
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # Attention output
+        x = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        x = self.out_proj(x)
+        
+        # FFN
+        out = self.norm2(x)
+        out = out + self.ffn(out)
+        
+        return out
 
 class Gate(nn.Module):
-    """Gate adapté pour les cryptos"""
-    def __init__(self, d_input, d_output, beta=2.0):  # beta réduit pour plus de réactivité
+    def __init__(self, d_input, d_output, beta=2.0):
         super().__init__()
-        self.trans = nn.Sequential(
+        self.beta = beta
+        self.d_output = d_output
+        
+        self.net = nn.Sequential(
             nn.Linear(d_input, d_input * 2),
             nn.GELU(),
             nn.Linear(d_input * 2, d_output)
         )
-        self.d_output = d_output
-        self.t = beta
-
-    def forward(self, gate_input):
-        output = self.trans(gate_input)
-        # Softmax avec température adaptative
-        volatility = torch.std(gate_input, dim=-1, keepdim=True)
-        temp = self.t * (1 + torch.sigmoid(volatility))
-        return self.d_output * torch.softmax(output/temp, dim=-1)
-
-class TemporalAttention(nn.Module):
-    """Attention temporelle finale avec biais de récence"""
-    def __init__(self, d_model):
-        super().__init__()
-        self.trans = nn.Linear(d_model, d_model, bias=True)
-
-    def forward(self, z):
-        h = self.trans(z)
-        query = h[:, -1, :].unsqueeze(-1)
         
-        # Scores d'attention avec biais de récence
-        base_scores = torch.matmul(h, query).squeeze(-1)
-        positions = torch.arange(base_scores.size(1), device=z.device).float()
-        recency_bias = torch.exp(-0.1 * (positions[-1] - positions))
+    def forward(self, x):
+        # x shape: (batch_size, d_input)
+        gate = self.net(x)
         
-        scores = base_scores * recency_bias.unsqueeze(0)
-        weights = torch.softmax(scores, dim=1).unsqueeze(1)
+        # Température adaptative
+        volatility = torch.std(x, dim=-1, keepdim=True)
+        temp = self.beta * (1 + torch.sigmoid(volatility))
         
-        return torch.matmul(weights, z).squeeze(1)
+        # Normalisation
+        gate = self.d_output * torch.softmax(gate / temp, dim=-1)
+        return gate
 
 class MASTER(nn.Module):
-    """MASTER adapté pour le trading crypto"""
-    def __init__(self, 
-                d_feat=40,  # Réduit pour crypto
-                d_model=256,
-                t_nhead=4,
-                s_nhead=2,
-                T_dropout_rate=0.3,  # Réduit
-                S_dropout_rate=0.3,
-                gate_input_start_index=40,
-                gate_input_end_index=60,  # 20 features de marché
-                beta=2.0):  # Plus réactif
-        super(MASTER, self).__init__()
+    def __init__(
+        self,
+        d_feat=40,
+        d_model=256,
+        t_nhead=4,
+        s_nhead=2,
+        T_dropout_rate=0.3,
+        S_dropout_rate=0.3,
+        gate_input_start_index=40,
+        gate_input_end_index=60,
+        beta=2.0
+    ):
+        super().__init__()
         
-        # Configuration du gate
+        self.d_feat = d_feat
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
-        self.d_gate_input = (gate_input_end_index - gate_input_start_index)
-        self.feature_gate = Gate(self.d_gate_input, d_feat, beta=beta)
-
-        # Pipeline principal
-        self.layers = nn.Sequential(
-            nn.Linear(d_feat, d_model),
-            PositionalEncoding(d_model),
-            TAttention(d_model=d_model, nhead=t_nhead, dropout=T_dropout_rate),
-            SAttention(d_model=d_model, nhead=s_nhead, dropout=S_dropout_rate),
-            TemporalAttention(d_model=d_model),
-            nn.Sequential(
-                nn.Linear(d_model, d_model // 2),
-                nn.GELU(),
-                nn.Dropout(p=0.1),
-                nn.Linear(d_model // 2, 1)
-            )
+        
+        # Gate mechanism
+        d_gate = gate_input_end_index - gate_input_start_index
+        self.feature_gate = Gate(d_gate, d_feat, beta=beta)
+        
+        # Main transformer pipeline
+        self.feature_proj = nn.Linear(d_feat, d_model)
+        self.pos_enc = PositionalEncoding(d_model)
+        self.temporal_attn = TAttention(d_model, t_nhead, T_dropout_rate)
+        self.spatial_attn = SAttention(d_model, s_nhead, S_dropout_rate)
+        
+        # Final prediction layers
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, 1)
         )
 
     def forward(self, x):
-        # Séparation des features et du marché
-        src = x[:, :, :self.gate_input_start_index]
-        gate_input = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]
+        # x shape: (batch_size, seq_length, total_features)
+        B, L, _ = x.shape
         
-        # Application du gate
-        src = src * torch.unsqueeze(self.feature_gate(gate_input), dim=1)
+        # Split features and market data
+        features = x[:, :, :self.gate_input_start_index]  # (B, L, d_feat)
+        market = x[:, -1, self.gate_input_start_index:self.gate_input_end_index]  # (B, d_gate)
         
-        # Forward pass
-        return self.layers(src).squeeze(-1)
+        # Apply feature gating
+        gate_weights = self.feature_gate(market)  # (B, d_feat)
+        gate_weights = gate_weights.unsqueeze(1).expand(-1, L, -1)  # (B, L, d_feat)
+        features = features * gate_weights
+        
+        # Transform sequence
+        x = self.feature_proj(features)  # (B, L, d_model)
+        x = self.pos_enc(x)
+        x = self.temporal_attn(x)
+        x = self.spatial_attn(x)
+        
+        # Use last timestep for prediction
+        x = x[:, -1]  # (B, d_model)
+        
+        # Final prediction
+        out = self.head(x).squeeze(-1)  # (B,)
+        return out
 
 class MASTERModel(CryptoSequenceModel):
     def __init__(
-            self, 
-            d_feat: int = 40,
-            d_model: int = 256,
-            t_nhead: int = 4,
-            s_nhead: int = 2,
-            gate_input_start_index=40,
-            gate_input_end_index=60,
-            T_dropout_rate=0.3,
-            S_dropout_rate=0.3,
-            beta=2.0,
-            **kwargs):
-        super(MASTERModel, self).__init__(**kwargs)
+        self,
+        d_feat=40,
+        d_model=256,
+        t_nhead=4,
+        s_nhead=2,
+        gate_input_start_index=40,
+        gate_input_end_index=60,
+        T_dropout_rate=0.3,
+        S_dropout_rate=0.3,
+        beta=2.0,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
         
-        self.d_model = d_model
         self.d_feat = d_feat
+        self.d_model = d_model
         self.gate_input_start_index = gate_input_start_index
         self.gate_input_end_index = gate_input_end_index
         self.T_dropout_rate = T_dropout_rate
@@ -267,7 +227,7 @@ class MASTERModel(CryptoSequenceModel):
         self.t_nhead = t_nhead
         self.s_nhead = s_nhead
         self.beta = beta
-
+        
         self.init_model()
 
     def init_model(self):
@@ -282,4 +242,4 @@ class MASTERModel(CryptoSequenceModel):
             gate_input_end_index=self.gate_input_end_index,
             beta=self.beta
         )
-        super(MASTERModel, self).init_model()
+        super().init_model()
