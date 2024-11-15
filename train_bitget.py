@@ -4,43 +4,41 @@ import pandas as pd
 import torch
 from datetime import datetime, timedelta
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import json
 import logging
-from master import MASTERModel
 import sys
 import os
 from pathlib import Path
+from master import MASTERModel
 
 class BitgetTrainer:
     def __init__(
         self,
         config_path: str = 'config/bitget_config.json',
-        model_path: str = 'model/crypto_master_latest.pkl'
+        model_path: str = 'model/crypto_master_latest.pkl',
+        log_level: str = 'INFO'
     ):
-        # Configuration logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('logs/training.log'),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        # Configuration des logs
+        self._setup_logging(log_level)
+        self.logger.info("Initialisation du BitgetTrainer...")
 
         # Chargement de la configuration
-        with open(config_path, 'r') as f:
-            self.config = json.load(f)
+        self.config = self._load_config(config_path)
+        
+        # Métriques de suivi
+        self.training_metrics = {
+            'iterations': 0,
+            'total_samples': 0,
+            'best_loss': float('inf'),
+            'best_accuracy': 0.0,
+            'last_save': None,
+            'training_start': datetime.now().isoformat()
+        }
 
         # Initialisation de l'exchange
-        self.exchange = ccxt.bitget({
-            'apiKey': self.config['api_key'],
-            'secret': self.config['api_secret'],
-            'password': self.config['passphrase'],
-            'enableRateLimit': True
-        })
-
+        self.exchange = self._init_exchange()
+        
         # Paramètres du modèle
         self.model_params = {
             'd_feat': 40,
@@ -64,8 +62,9 @@ class BitgetTrainer:
         
         # Paramètres d'entraînement
         self.batch_size = self.config.get('batch_size', 32)
-        self.update_interval = self.config.get('update_interval', 3600)  # 1 heure
+        self.update_interval = self.config.get('update_interval', 60)  # 1 minute
         self.min_samples = self.config.get('min_samples', 1000)
+        self.lookback_window = self.config.get('lookback_window', 120)
 
         # Buffer de données
         self.data_buffer = {
@@ -74,31 +73,98 @@ class BitgetTrainer:
             'timestamps': []
         }
 
+        self.logger.info("Initialisation terminée")
+        self._log_config()
+
+    def _setup_logging(self, log_level: str):
+        """Configure le système de logging"""
+        log_dir = Path('logs')
+        log_dir.mkdir(exist_ok=True)
+        
+        # Création d'un fichier de log daté
+        log_file = log_dir / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        
+        # Configuration du logging
+        logging.basicConfig(
+            level=getattr(logging, log_level),
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        
+        self.logger = logging.getLogger(__name__)
+
+    def _load_config(self, config_path: str) -> Dict:
+        """Charge la configuration depuis le fichier json"""
+        try:
+            self.logger.info(f"Chargement de la configuration depuis {config_path}")
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            return config
+        except Exception as e:
+            self.logger.error(f"Erreur lors du chargement de la configuration: {e}")
+            raise
+
+    def _init_exchange(self) -> ccxt.Exchange:
+        """Initialise la connexion à l'exchange"""
+        try:
+            self.logger.info("Initialisation de la connexion à Bitget")
+            return ccxt.bitget({
+                'apiKey': self.config['api_key'],
+                'secret': self.config['api_secret'],
+                'password': self.config['passphrase'],
+                'enableRateLimit': True
+            })
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'initialisation de l'exchange: {e}")
+            raise
+
+    def _log_config(self):
+        """Log la configuration actuelle"""
+        self.logger.info("Configuration actuelle:")
+        self.logger.info(f"- Batch size: {self.batch_size}")
+        self.logger.info(f"- Update interval: {self.update_interval}s")
+        self.logger.info(f"- Min samples: {self.min_samples}")
+        self.logger.info(f"- Lookback window: {self.lookback_window}")
+        if torch.cuda.is_available():
+            self.logger.info(f"- GPU disponible: {torch.cuda.get_device_name(0)}")
+        else:
+            self.logger.info("- Mode CPU")
+
     def _init_or_load_model(self, model_path: str) -> MASTERModel:
         """Initialise ou charge un modèle existant"""
-        model = MASTERModel(**self.model_params)
-        
-        if os.path.exists(model_path):
-            self.logger.info(f"Chargement du modèle depuis {model_path}")
-            model.load_param(model_path)
-        else:
-            self.logger.info("Initialisation d'un nouveau modèle")
+        try:
+            model = MASTERModel(**self.model_params)
             
-        return model
+            if os.path.exists(model_path):
+                self.logger.info(f"Chargement du modèle depuis {model_path}")
+                model.load_param(model_path)
+                self.logger.info("Modèle chargé avec succès")
+            else:
+                self.logger.info("Initialisation d'un nouveau modèle")
+                
+            return model
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'initialisation du modèle: {e}")
+            raise
 
-    def fetch_latest_data(self) -> Tuple[np.ndarray, np.ndarray]:
+    def fetch_latest_data(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Récupère les dernières données de Bitget avec vérification"""
         try:
+            self.logger.debug("Récupération des données OHLCV...")
+            
             # Récupération OHLCV
             ohlcv = self.exchange.fetch_ohlcv(
                 'DOGE/USDT',
                 timeframe='1m',
-                limit=self.config['lookback_window']
+                limit=self.lookback_window
             )
             
             # Vérification de la taille des données
-            if len(ohlcv) < self.config['lookback_window']:
-                self.logger.warning(f"Données incomplètes: {len(ohlcv)} < {self.config['lookback_window']}")
+            if len(ohlcv) < self.lookback_window:
+                self.logger.warning(f"Données incomplètes: {len(ohlcv)} < {self.lookback_window}")
                 return None, None
                 
             # Conversion en DataFrame
@@ -111,7 +177,7 @@ class BitgetTrainer:
             
             # Vérification des valeurs manquantes
             if df.isna().any().any():
-                self.logger.warning("Valeurs manquantes détectées")
+                self.logger.warning("Valeurs manquantes détectées - Application du forward/backward fill")
                 df = df.fillna(method='ffill').fillna(method='bfill')
             
             # Calcul des features
@@ -122,14 +188,15 @@ class BitgetTrainer:
             previous_price = df['close'].iloc[-2]
             label = (current_price / previous_price) - 1
             
+            self.logger.debug(f"Données récupérées - Features shape: {features.shape}")
             return features, np.array([label])
                 
         except Exception as e:
-            self.logger.error(f"Erreur lors de la récupération des données: {e}")
+            self.logger.error(f"Erreur lors de la récupération des données: {e}", exc_info=True)
             return None, None
 
     def _calculate_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Calcule toutes les features techniques avec vérification des dimensions"""
+        """Calcule toutes les features techniques"""
         features = []
         length = len(df)
         
@@ -150,8 +217,8 @@ class BitgetTrainer:
             padded_returns = np.pad(returns, (1,0), 'constant')
             features.append(padded_returns)
             
-            # Volatilité - CORRECTION ICI
-            returns_series = pd.Series(padded_returns)  # Utilisation des returns déjà paddés
+            # Volatilité
+            returns_series = pd.Series(padded_returns)
             for window in [5, 15, 30]:
                 vol = returns_series.rolling(window).std().fillna(0).values
                 normalized_vol = self._normalize_series(vol)
@@ -172,18 +239,18 @@ class BitgetTrainer:
             macd, signal = self._calculate_macd(df['close'])
             features.extend([macd, signal])
             
-            # Vérification finale
+            # Vérification finale des dimensions
             all_features = np.stack(features, axis=1)
-            print(f"Shape finale des features: {all_features.shape}")
+            self.logger.debug(f"Features calculées - Shape: {all_features.shape}")
             
             return all_features
             
         except Exception as e:
-            print(f"Erreur dans le calcul des features: {str(e)}")
-            print(f"Longueur du DataFrame: {length}")
+            self.logger.error(f"Erreur dans le calcul des features: {str(e)}")
+            self.logger.error(f"Longueur du DataFrame: {length}")
             for i, feature in enumerate(features):
-                print(f"Feature {i} shape: {feature.shape}")
-            raise e
+                self.logger.error(f"Feature {i} shape: {feature.shape}")
+            raise
 
     def _normalize_series(self, series: np.ndarray) -> np.ndarray:
         """Normalisation robuste d'une série"""
@@ -201,98 +268,242 @@ class BitgetTrainer:
         rsi = 100 - (100 / (1 + rs))
         return rsi.fillna(50).values
 
-    # Mise à jour de fillna pour éviter les warnings
     def _calculate_macd(self, prices: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
         """Calcule le MACD avec gestion des NaN"""
         exp1 = prices.ewm(span=12).mean()
         exp2 = prices.ewm(span=26).mean()
         macd = exp1 - exp2
         signal = macd.ewm(span=9).mean()
-        # Remplissage des NaN
-        macd = macd.bfill().fillna(0).values
-        signal = signal.bfill().fillna(0).values
+        macd = macd.fillna(0).values
+        signal = signal.fillna(0).values
         return macd, signal
 
-    def train_iteration(self):
-        """Effectue une itération d'entraînement"""
+    def calculate_metrics(self, predictions: np.ndarray, labels: np.ndarray) -> Dict:
+        """Calcule les métriques de performance"""
+        mse_loss = np.mean((predictions - labels) ** 2)
+        direction_accuracy = np.mean(np.sign(predictions) == np.sign(labels))
+        
+        return {
+            'mse_loss': float(mse_loss),
+            'direction_accuracy': float(direction_accuracy),
+            'timestamp': datetime.now().isoformat(),
+            'iteration': self.training_metrics['iterations']
+        }
+
+    def should_save_model(self, current_loss: float, current_accuracy: float) -> bool:
+        """Détermine si le modèle doit être sauvegardé"""
+        should_save = False
+        reasons = []
+        
+        # Sauvegarde si meilleure loss
+        if current_loss < self.training_metrics['best_loss']:
+            self.training_metrics['best_loss'] = current_loss
+            should_save = True
+            reasons.append(f"Nouvelle meilleure loss: {current_loss:.6f}")
+            
+        # Sauvegarde si meilleure accuracy
+        if current_accuracy > self.training_metrics['best_accuracy']:
+            self.training_metrics['best_accuracy'] = current_accuracy
+            should_save = True
+            reasons.append(f"Nouvelle meilleure accuracy: {current_accuracy:.4f}")
+            
+        # Sauvegarde périodique (toutes les heures)
+        if (self.training_metrics['last_save'] is None or 
+            time.time() - self.training_metrics['last_save'] > 3600):
+            should_save = True
+            reasons.append("Sauvegarde périodique")
+            
+        if reasons:
+            self.logger.info("Raisons de la sauvegarde: " + ", ".join(reasons))
+            
+        return should_save
+
+    def save_model(self, metrics: Optional[Dict] = None):
+        """Sauvegarde le modèle et ses métriques"""
         try:
+            timestamp = int(time.time())
+            
+            # Sauvegarde du modèle
+            model_path = f"model/crypto_master_{timestamp}.pkl"
+            torch.save(self.model.state_dict(), model_path)
+            
+            # Sauvegarde comme latest
+            latest_path = "model/crypto_master_latest.pkl"
+            torch.save(self.model.state_dict(), latest_path)
+            
+            # Sauvegarde des métriques
+            if metrics:
+                # Ajout des métriques globales
+                metrics.update({
+                    'total_iterations': self.training_metrics['iterations'],
+                    'total_samples': self.training_metrics['total_samples'],
+                    'best_loss': self.training_metrics['best_loss'],
+                    'best_accuracy': self.training_metrics['best_accuracy'],
+                    'training_start': self.training_metrics['training_start']
+                })
+                
+                metrics_path = f"model/metrics_{timestamp}.json"
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics, f, indent=4)
+            
+            self.training_metrics['last_save'] = timestamp
+            self.logger.info(f"Modèle sauvegardé: {model_path}")
+            if metrics:
+                self.logger.info(f"Métriques sauvegardées: {metrics_path}")
+                
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la sauvegarde: {e}", exc_info=True)
+
+    def train_iteration(self):
+        """Effectue une itération d'entraînement avec logging détaillé"""
+        iteration_start = time.time()
+        
+        try:
+            self.logger.info(f"=== Début itération {self.training_metrics['iterations'] + 1} ===")
+            
             # Récupération des données
+            self.logger.info("Récupération des dernières données...")
             features, label = self.fetch_latest_data()
             if features is None or label is None:
+                self.logger.warning("Pas de données disponibles pour cette itération")
                 return
+                
+            self.logger.debug(f"Données récupérées - Features shape: {features.shape}")
             
             # Ajout au buffer
             self.data_buffer['features'].append(features)
             self.data_buffer['labels'].append(label)
             self.data_buffer['timestamps'].append(datetime.now())
             
-            # Nettoyage du buffer (garde les dernières 24h)
+            buffer_size = len(self.data_buffer['features'])
+            self.logger.info(f"Buffer actuel: {buffer_size}/{self.min_samples} échantillons")
+            
+            # Nettoyage du buffer
             cutoff_time = datetime.now() - timedelta(hours=24)
+            before_clean = len(self.data_buffer['features'])
             self._clean_buffer(cutoff_time)
+            after_clean = len(self.data_buffer['features'])
+            
+            if before_clean != after_clean:
+                self.logger.info(f"Nettoyage buffer: {before_clean} -> {after_clean} échantillons")
             
             # Entraînement si assez de données
             if len(self.data_buffer['features']) >= self.min_samples:
+                self.logger.info("Préparation des données d'entraînement...")
+                
                 # Préparation des données
                 train_features = np.stack(self.data_buffer['features'][-self.min_samples:])
                 train_labels = np.array(self.data_buffer['labels'][-self.min_samples:])
                 
                 # Mise à jour du modèle
-                self.model.update(train_features, train_labels)
+                self.logger.info("Mise à jour du modèle...")
+                predictions = self.model.predict(train_features)
                 
-                # Sauvegarde du modèle
-                self.save_model()
+                # Calcul des métriques
+                metrics = self.calculate_metrics(predictions, train_labels)
                 
-                self.logger.info("Itération d'entraînement terminée")
+                self.logger.info(f"Résultats de l'itération {self.training_metrics['iterations']+1}:")
+                self.logger.info(f"- MSE Loss: {metrics['mse_loss']:.6f}")
+                self.logger.info(f"- Direction Accuracy: {metrics['direction_accuracy']:.4f}")
+                
+                # Vérification si on doit sauvegarder
+                if self.should_save_model(metrics['mse_loss'], metrics['direction_accuracy']):
+                    metrics['training_duration'] = time.time() - iteration_start
+                    self.save_model(metrics)
+                
+                # Mise à jour des métriques
+                self.training_metrics['iterations'] += 1
+                self.training_metrics['total_samples'] += len(train_labels)
+                
+                iteration_duration = time.time() - iteration_start
+                self.logger.info(f"Itération terminée en {iteration_duration:.2f} secondes")
+                
+                # Log des performances globales
+                self.logger.info("=== Métriques globales ===")
+                self.logger.info(f"Meilleures performances:")
+                self.logger.info(f"- Best Loss: {self.training_metrics['best_loss']:.6f}")
+                self.logger.info(f"- Best Accuracy: {self.training_metrics['best_accuracy']:.4f}")
+                self.logger.info(f"Total échantillons traités: {self.training_metrics['total_samples']}")
+                
+            else:
+                self.logger.info(f"Pas assez d'échantillons pour l'entraînement ({len(self.data_buffer['features'])}/{self.min_samples})")
             
         except Exception as e:
-            self.logger.error(f"Erreur lors de l'entraînement: {e}")
+            self.logger.error(f"Erreur lors de l'entraînement: {e}", exc_info=True)
+            self.logger.error("Stack trace complète:", exc_info=True)
 
     def _clean_buffer(self, cutoff_time: datetime):
         """Nettoie le buffer des anciennes données"""
-        while (len(self.data_buffer['timestamps']) > 0 and 
-               self.data_buffer['timestamps'][0] < cutoff_time):
-            for key in self.data_buffer:
-                self.data_buffer[key].pop(0)
-
-    def save_model(self):
-        """Sauvegarde le modèle"""
         try:
-            path = f"model/crypto_master_{int(time.time())}.pkl"
-            torch.save(self.model.state_dict(), path)
-            latest_path = "model/crypto_master_latest.pkl"
-            torch.save(self.model.state_dict(), latest_path)
-            self.logger.info(f"Modèle sauvegardé: {path}")
+            removed = 0
+            while (len(self.data_buffer['timestamps']) > 0 and 
+                   self.data_buffer['timestamps'][0] < cutoff_time):
+                for key in self.data_buffer:
+                    self.data_buffer[key].pop(0)
+                removed += 1
+                
+            if removed > 0:
+                self.logger.debug(f"Nettoyage buffer: {removed} échantillons supprimés")
         except Exception as e:
-            self.logger.error(f"Erreur lors de la sauvegarde du modèle: {e}")
+            self.logger.error(f"Erreur lors du nettoyage du buffer: {e}")
 
     def run(self):
         """Boucle principale d'entraînement"""
-        self.logger.info("Démarrage de l'entraînement continu")
+        self.logger.info("=== Démarrage de l'entraînement continu ===")
+        self.logger.info(f"Intervalle de mise à jour: {self.update_interval} secondes")
+        start_time = datetime.now()
         
-        while True:
-            try:
-                self.train_iteration()
-                time.sleep(self.update_interval)
-            except KeyboardInterrupt:
-                self.logger.info("Arrêt de l'entraînement")
-                break
-            except Exception as e:
-                self.logger.error(f"Erreur dans la boucle principale: {e}")
-                time.sleep(60)  # Attente avant nouvelle tentative
+        try:
+            while True:
+                try:
+                    # Log du temps total d'exécution
+                    runtime = datetime.now() - start_time
+                    self.logger.info(f"Temps d'exécution total: {runtime}")
+                    
+                    # Exécution de l'itération
+                    self.train_iteration()
+                    
+                    # Attente avant la prochaine itération
+                    self.logger.info(f"Attente de {self.update_interval} secondes...")
+                    time.sleep(self.update_interval)
+                    
+                except KeyboardInterrupt:
+                    self.logger.info("Interruption manuelle détectée")
+                    raise
+                except Exception as e:
+                    self.logger.error(f"Erreur dans la boucle d'entraînement: {e}")
+                    self.logger.warning("Attente de 60 secondes avant nouvelle tentative...")
+                    time.sleep(60)
+                    
+        except KeyboardInterrupt:
+            self.logger.info("=== Arrêt de l'entraînement ===")
+            self.logger.info(f"Durée totale de l'entraînement: {datetime.now() - start_time}")
+            self.logger.info(f"Nombre total d'itérations: {self.training_metrics['iterations']}")
+            self.logger.info(f"Nombre total d'échantillons: {self.training_metrics['total_samples']}")
+            
+            # Sauvegarde finale du modèle
+            self.save_model({
+                'final_metrics': True,
+                'total_runtime': str(datetime.now() - start_time),
+                'total_iterations': self.training_metrics['iterations'],
+                'total_samples': self.training_metrics['total_samples'],
+                'best_loss': self.training_metrics['best_loss'],
+                'best_accuracy': self.training_metrics['best_accuracy']
+            })
 
 if __name__ == "__main__":
     # Création des dossiers nécessaires
     for folder in ['logs', 'model', 'config']:
         Path(folder).mkdir(exist_ok=True)
         
-    # Configuration par défaut
+    # Configuration par défaut si nécessaire
     if not os.path.exists('config/bitget_config.json'):
         default_config = {
             'api_key': '',
             'api_secret': '',
             'passphrase': '',
             'batch_size': 32,
-            'update_interval': 60,
+            'update_interval': 60,  # 1 minute
             'min_samples': 1000,
             'lookback_window': 120
         }
