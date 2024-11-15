@@ -22,9 +22,14 @@ class BitgetTrainer:
         # Configuration des logs
         self._setup_logging(log_level)
         self.logger.info("Initialisation du BitgetTrainer...")
-
+        
         # Chargement de la configuration
         self.config = self._load_config(config_path)
+        
+        # Setup du device (GPU/CPU)
+        self.device = torch.device(f"cuda:{self.model_params['GPU']}" 
+                                if torch.cuda.is_available() and self.model_params['GPU'] is not None 
+                                else "cpu")
         
         # Métriques de suivi
         self.training_metrics = {
@@ -62,7 +67,7 @@ class BitgetTrainer:
         
         # Paramètres d'entraînement
         self.batch_size = self.config.get('batch_size', 32)
-        self.update_interval = self.config.get('update_interval', 60)  # 1 minute
+        self.update_interval = self.config.get('update_interval', 60)
         self.min_samples = self.config.get('min_samples', 1000)
         self.lookback_window = self.config.get('lookback_window', 120)
 
@@ -72,9 +77,6 @@ class BitgetTrainer:
             'labels': [],
             'timestamps': []
         }
-
-        self.logger.info("Initialisation terminée")
-        self._log_config()
 
     def _setup_logging(self, log_level: str):
         """Configure le système de logging"""
